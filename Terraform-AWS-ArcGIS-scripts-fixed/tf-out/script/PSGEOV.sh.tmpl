@@ -1,0 +1,137 @@
+#!/bin/bash
+# ==============================================================================
+# bootstrap-arcgis-psgeov.sh
+# ==============================================================================
+set -euo pipefail
+
+exec > >(tee -a /var/log/arcgis-bootstrap.log) 2>&1
+echo "=== Bootstrap started: $(date) ==="
+
+# ==============================
+# [1] Set Hostname
+# ==============================
+sudo sed -i 's/ip-10-0-6-10/psgeov.esriindonesia.co.id/g' /etc/hostname
+hostname psgeov.esriindonesia.co.id
+
+# ==============================
+# [2] Install dependencies
+# ==============================
+sudo apt update -y
+sudo apt install -y unzip curl
+
+# ==============================
+# [3] Insert Hosts File
+# ==============================
+sudo chmod 777 /etc/hosts
+sudo cat << EOF > /etc/hosts
+127.0.0.1   localhost
+10.0.4.10   psage.esriindonesia.co.id
+10.0.5.10   psspatio.esriindonesia.co.id
+10.0.6.10   psgeov.esriindonesia.co.id
+EOF
+
+# ==============================
+# [4] Install AWS CLI
+# ==============================
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/awscliv2.zip /tmp/aws
+export PATH=$PATH:/usr/local/bin
+hash -r
+export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION}"
+
+# ==============================
+# [5] Create software directories
+# ==============================
+mkdir -p /opt/software/archives /opt/software/setups
+
+# ==============================
+# [6] Download ArcGIS installer from S3
+# ==============================
+aws s3 cp s3://arcgis-installer-bucket/ArcGIS_GeoEvent_Linux_113_190318.tar.gz /opt/software/archives/
+
+# ==============================
+# [7] Install Cinc
+# ==============================
+curl -fsSL https://omnitruck.cinc.sh/install.sh -o /tmp/cinc-install.sh
+bash /tmp/cinc-install.sh -v 18
+rm /tmp/cinc-install.sh
+export PATH=$PATH:/opt/cinc/bin
+hash -r
+
+# ==============================
+# [8] Download & extract ArcGIS cookbooks
+# ==============================
+COOKBOOK_DIR="/opt/cinc/cookbooks"
+mkdir -p "$COOKBOOK_DIR"
+curl -fsSL "https://github.com/Esri/arcgis-cookbook/releases/download/v5.0.0/arcgis-5.0.0-cookbooks.tar.gz" \
+  -o /tmp/arcgis.tar.gz
+tar -xzvf /tmp/arcgis.tar.gz -C "$COOKBOOK_DIR"
+rm /tmp/arcgis.tar.gz
+
+# ==============================
+# [9] Write JSON config
+# ==============================
+CONFIG_DIR="/opt/cinc/config"
+mkdir -p "$CONFIG_DIR"
+
+cat > "$CONFIG_DIR/geoevent-server-install.json" << 'JSONEOF'
+${arcgis_enterprise_geoevent_install}
+JSONEOF
+
+cat > "$CONFIG_DIR/geoevent-server.json" << 'JSONEOF'
+${arcgis_enterprise_geoevent_server}
+JSONEOF
+
+cat > "$CONFIG_DIR/geoevent-server-federation.json" << 'JSONEOF'
+${arcgis_enterprise_geoevent_federation}
+JSONEOF
+
+# ==============================
+# [10] Disable firewall
+# ==============================
+if command -v ufw &>/dev/null; then
+  ufw disable
+elif command -v iptables &>/dev/null; then
+  iptables -F
+  iptables -P INPUT ACCEPT
+  iptables -P FORWARD ACCEPT
+  iptables -P OUTPUT ACCEPT
+fi
+
+# ==============================
+# [11] Run Cinc — Install GeoEvent Server
+# ==============================
+cinc-client -z \
+  --cookbook-path "$COOKBOOK_DIR" \
+  -j "$CONFIG_DIR/geoevent-server-install.json" \
+  -l debug
+
+# ==============================
+# [12] Tunggu PSAGE ArcGIS Server ready
+# ==============================
+echo "Waiting for PSAGE ArcGIS Server to be ready..."
+for _ in $(seq 1 60); do
+  if curl -sk --max-time 10 "https://psage.esriindonesia.co.id:6443/arcgis/rest/info" \
+      | grep -q "currentVersion"; then
+    echo "PSAGE ArcGIS Server is up."
+    break
+  fi
+  sleep 30
+done
+
+# ==============================
+# [13] Run Cinc — Configure & Federate GeoEvent
+# ==============================
+cinc-client -z \
+  --cookbook-path "$COOKBOOK_DIR" \
+  -j "$CONFIG_DIR/geoevent-server.json" \
+  -l debug
+
+cinc-client -z \
+  --cookbook-path "$COOKBOOK_DIR" \
+  -j "$CONFIG_DIR/geoevent-server-federation.json" \
+  -l debug
+
+echo "=== Bootstrap finished: $(date) ==="

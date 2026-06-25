@@ -1,0 +1,159 @@
+# ==============================================================================
+# bootstrap-arcgis-psage.ps1
+# ==============================================================================
+
+$ErrorActionPreference = "Stop"
+Start-Transcript -Path "C:\arcgis-bootstrap.log" -Append
+
+# ==============================
+# [0] Base directory (NEW CLEAN)
+# ==============================
+$BASE_DIR      = "C:\arcgis\psage"
+$SOFT_DIR      = "$BASE_DIR\software"
+$CONFIG_DIR    = "$BASE_DIR\config"
+$COOKBOOK_DIR  = "$BASE_DIR\cookbooks"
+
+New-Item -ItemType Directory -Force -Path $SOFT_DIR     | Out-Null
+New-Item -ItemType Directory -Force -Path $CONFIG_DIR   | Out-Null
+New-Item -ItemType Directory -Force -Path $COOKBOOK_DIR | Out-Null
+
+# ==============================
+# [1] Set Hostname (FIXED)
+# ==============================
+Rename-Computer -NewName "psage" -Force
+
+# ==============================
+# [2] Update Hosts (SAFE)
+# ==============================
+$hostsPath = "$env:SystemRoot\System32\drivers\etc\hosts"
+
+Add-Content -Path $hostsPath -Value @"
+10.0.4.10   psage.esriindonesia.co.id
+10.0.5.10   psspatio.esriindonesia.co.id
+10.0.6.10   psgeov.esriindonesia.co.id
+"@
+
+Write-Output "Hosts file updated."
+
+# ==============================
+# [3] Install AWS CLI
+# ==============================
+Invoke-WebRequest -Uri "https://awscli.amazonaws.com/AWSCLIV2.msi" `
+  -OutFile "C:\AWSCLIV2.msi" -UseBasicParsing
+
+Start-Process msiexec.exe `
+  -ArgumentList "/i C:\AWSCLIV2.msi /quiet /norestart" `
+  -Wait
+
+$env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+$env:AWS_DEFAULT_REGION = "${AWS_DEFAULT_REGION}"
+
+# ==============================
+# [4] Download installer
+# ==============================
+aws s3 cp s3://arcgis-installer-bucket/ArcGIS_DataStore_Windows_113_190318.zip "$SOFT_DIR\"
+
+# ==============================
+# [5] Install Cinc
+# ==============================
+Invoke-WebRequest -Uri "https://omnitruck.cinc.sh/install.ps1" `
+  -OutFile "C:\cinc-install.ps1" -UseBasicParsing
+
+& C:\cinc-install.ps1 -version 18
+
+$env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine")
+
+# ==============================
+# [6] Download & extract cookbooks
+# ==============================
+Invoke-WebRequest `
+  -Uri "https://github.com/Esri/arcgis-cookbook/releases/download/v5.0.0/arcgis-5.0.0-cookbooks.tar.gz" `
+  -OutFile "C:\arcgis.tar.gz" -UseBasicParsing
+
+tar -xzvf C:\arcgis.tar.gz -C $COOKBOOK_DIR
+
+# ==============================
+# [7] Write JSON config
+# ==============================
+Set-Content -Path "$CONFIG_DIR\arcgis-portal-install.json" -Value @'
+${arcgis_enterprise_portal_install}
+'@
+
+Set-Content -Path "$CONFIG_DIR\arcgis-portal-primary.json" -Value @'
+${arcgis_enterprise_portal_primary}
+'@
+
+Set-Content -Path "$CONFIG_DIR\arcgis-server-install.json" -Value @'
+${arcgis_enterprise_server_install}
+'@
+
+Set-Content -Path "$CONFIG_DIR\arcgis-server.json" -Value @'
+${arcgis_enterprise_server}
+'@
+
+Set-Content -Path "$CONFIG_DIR\gis-server-federation.json" -Value @'
+${arcgis_enterprise_server_federation}
+'@
+
+Set-Content -Path "$CONFIG_DIR\arcgis-datastore-install.json" -Value @'
+${arcgis_enterprise_ds_install}
+'@
+
+Set-Content -Path "$CONFIG_DIR\arcgis-datastore-relational-primary.json" -Value @'
+${arcgis_enterprise_ds_primary}
+'@
+
+Set-Content -Path "$CONFIG_DIR\imagehosting-federation.json" -Value @'
+${arcgis_enterprise_image_federation}
+'@
+
+# ==============================
+# [8] Disable firewall
+# ==============================
+Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled False
+
+# ==============================
+# [9] Run Cinc - Install
+# ==============================
+cd $COOKBOOK_DIR
+
+cinc-client -z --cookbook-path $COOKBOOK_DIR -j "$CONFIG_DIR\arcgis-portal-install.json"    -l debug
+cinc-client -z --cookbook-path $COOKBOOK_DIR -j "$CONFIG_DIR\arcgis-server-install.json"    -l debug
+cinc-client -z --cookbook-path $COOKBOOK_DIR -j "$CONFIG_DIR\arcgis-datastore-install.json" -l debug
+
+# ==============================
+# [10] Wait Portal
+# ==============================
+Write-Output "Waiting for ArcGIS Portal..."
+
+$ready = $false
+for ($i = 1; $i -le 60; $i++) {
+    try {
+        $resp = Invoke-WebRequest `
+          -Uri "https://localhost:7443/arcgis/portaladmin" `
+          -UseBasicParsing -SkipCertificateCheck -TimeoutSec 10
+
+        if ($resp.StatusCode -lt 400) {
+            $ready = $true
+            Write-Output "Portal ready"
+            break
+        }
+    } catch {}
+
+    Start-Sleep -Seconds 30
+}
+
+if (-not $ready) {
+    Throw "Portal not ready"
+}
+
+# ==============================
+# [11] Configure & Federate
+# ==============================
+cinc-client -z --cookbook-path $COOKBOOK_DIR -j "$CONFIG_DIR\arcgis-portal-primary.json"               -l debug
+cinc-client -z --cookbook-path $COOKBOOK_DIR -j "$CONFIG_DIR\arcgis-server.json"                       -l debug
+cinc-client -z --cookbook-path $COOKBOOK_DIR -j "$CONFIG_DIR\arcgis-datastore-relational-primary.json" -l debug
+cinc-client -z --cookbook-path $COOKBOOK_DIR -j "$CONFIG_DIR\gis-server-federation.json"               -l debug
+cinc-client -z --cookbook-path $COOKBOOK_DIR -j "$CONFIG_DIR\imagehosting-federation.json"             -l debug
+
+Stop-Transcript
